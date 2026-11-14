@@ -1,0 +1,107 @@
+name: Release
+
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "要发布的 tag（例如 v0.1.0，必须已存在）"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-gnu
+          - os: macos-latest
+            target: aarch64-apple-darwin
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: cargo build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+
+      - name: 打包（unix）
+        if: runner.os != 'Windows'
+        run: |
+          cd target/${{ matrix.target }}/release
+          tar -czf "$GITHUB_WORKSPACE/dy-live-tui-${{ matrix.target }}.tar.gz" dy-live-tui
+          cd "$GITHUB_WORKSPACE"
+          sha256sum "dy-live-tui-${{ matrix.target }}.tar.gz" > "dy-live-tui-${{ matrix.target }}.tar.gz.sha256"
+
+      - name: 打包（windows）
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Compress-Archive -Path "target/${{ matrix.target }}/release/dy-live-tui.exe" `
+            -DestinationPath "dy-live-tui-${{ matrix.target }}.zip"
+          (Get-FileHash "dy-live-tui-${{ matrix.target }}.zip" -Algorithm SHA256).Hash.ToLower() +
+            "  dy-live-tui-${{ matrix.target }}.zip" | Out-File -Encoding ascii `
+            "dy-live-tui-${{ matrix.target }}.zip.sha256"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: dist-${{ matrix.target }}
+          if-no-files-found: error
+          path: |
+            dy-live-tui-${{ matrix.target }}.*
+            !dy-live-tui-${{ matrix.target }}.d
+
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: dist
+          merge-multiple: true
+
+      - name: 汇总校验和
+        run: |
+          cd dist
+          ls -lh
+          cat *.sha256 > SHA256SUMS.txt
+          rm -f *.sha256
+
+      - name: 创建 / 更新 Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            gh release upload "$TAG" dist/* --clobber --repo "$GITHUB_REPOSITORY"
+          else
+            gh release create "$TAG" dist/* \
+              --repo "$GITHUB_REPOSITORY" \
+              --title "$TAG" \
+              --generate-notes
+          fi

@@ -72,7 +72,6 @@ fn draw_header(f: &mut Frame, app: &App, area: Rect) {
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
-    let cursor = if app.input.is_empty() { "" } else { "" };
     let mut lines = vec![
         Line::from(vec![
             Span::styled("直播间 ", Style::default().fg(Color::DarkGray)),
@@ -88,7 +87,7 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         Line::from(vec![
             Span::styled("❯ ", Style::default().fg(Color::Red).bold()),
             Span::raw(app.input.clone()),
-            Span::styled(format!("{cursor}█"), Style::default().fg(Color::Red)),
+            Span::styled("█", Style::default().fg(Color::Red)),
         ]),
         Line::from(""),
         Line::from(Span::styled(
@@ -179,7 +178,7 @@ fn draw_quality(f: &mut Frame, app: &App, area: Rect) {
             let pending = !c.probe.done;
             let ok = c.probe.ok();
             let (mark, color) = if pending {
-                (format!("{}", app.spinner_char()), Color::Yellow)
+                (app.spinner_char().to_string(), Color::Yellow)
             } else if ok {
                 ("✓ 200".to_string(), Color::Green)
             } else if c.probe.code == 0 {
@@ -282,7 +281,7 @@ mod tests {
         let mut out = String::new();
         for y in 0..area.height {
             for x in 0..area.width {
-                out.push_str(&buf[(x, y)].symbol().to_string());
+                out.push_str(buf[(x, y)].symbol());
             }
             out.push('\n');
         }

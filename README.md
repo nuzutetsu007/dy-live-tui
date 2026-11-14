@@ -1,5 +1,9 @@
 # dy-live-tui
 
+[![CI](https://github.com/nuzutetsu007/dy-live-tui/actions/workflows/ci.yml/badge.svg)](https://github.com/nuzutetsu007/dy-live-tui/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/nuzutetsu007/dy-live-tui?display_name=tag)](https://github.com/nuzutetsu007/dy-live-tui/releases/latest)
+[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
+
 抖音直播间 → 带签名的直链 → 选清晰度 → 测连通 → 本地 mpv 播放。
 纯 Rust（`ureq` + `ratatui`），解析过程不调用 Python / curl / 任何外部脚本；只有最后的播放会 `spawn mpv`。
 
@@ -25,8 +29,27 @@
 
 ## 构建 & 安装
 
+直接下预编译二进制（推荐）：
+
 ```bash
-cd ~/code/dy-live-tui
+# Linux x86_64
+curl -L https://github.com/nuzutetsu007/dy-live-tui/releases/latest/download/dy-live-tui-x86_64-unknown-linux-gnu.tar.gz \
+  | tar xz
+install -m755 dy-live-tui ~/.local/bin/
+
+# 其它平台把文件名换成：
+#   dy-live-tui-aarch64-unknown-linux-gnu.tar.gz
+#   dy-live-tui-aarch64-apple-darwin.tar.gz
+#   dy-live-tui-x86_64-pc-windows-msvc.zip
+```
+
+每个包旁边都有对应的 `.sha256`，`SHA256SUMS.txt` 里是全部。
+
+从源码：
+
+```bash
+git clone https://github.com/nuzutetsu007/dy-live-tui
+cd dy-live-tui
 cargo build --release
 ln -sf "$PWD/target/release/dy-live-tui" ~/.local/bin/dy-live-tui
 ```

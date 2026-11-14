@@ -4,7 +4,8 @@
 //!   1. GET https://live.douyin.com/<rid>            —— 只为拿 ttwid cookie（可选，失败不影响）
 //!   2. GET https://live.douyin.com/webcast/room/web/enter/?...&web_rid=<rid>
 //!      → data.data[0].stream_url.hls_pull_url_map / flv_pull_url（带 sign）
-//!   注意：页面内嵌的地址没有 sign，直接拉会被 CDN 403。
+//!
+//! 注意：页面内嵌的地址没有 sign，直接拉会被 CDN 403。
 
 use serde_json::Value;
 use std::time::{Duration, Instant};
@@ -250,7 +251,7 @@ fn sdk_candidates(stream: &Value) -> Vec<Candidate> {
             key,
         ));
     }
-    tiers.sort_by(|a, b| b.0.cmp(&a.0));
+    tiers.sort_by_key(|b| std::cmp::Reverse(b.0));
 
     let mut list = Vec::new();
     for (_, name, res, fps, key) in tiers {

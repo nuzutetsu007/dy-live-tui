@@ -1,0 +1,49 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+    paths-ignore:
+      - "**.md"
+      - "LICENSE"
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+
+jobs:
+  check:
+    name: fmt + clippy + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt
+        run: cargo fmt --all -- --check
+
+      - name: cargo clippy
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --all
+
+      # 真实网络测试需要房间正在直播，CI 里不跑
+      - name: 网络测试（可选，仅手动触发）
+        if: github.event_name == 'workflow_dispatch'
+        run: cargo test -- --ignored
+        continue-on-error: true
+
+      - name: cargo build --release
+        run: cargo build --release

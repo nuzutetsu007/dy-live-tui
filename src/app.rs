@@ -250,13 +250,10 @@ impl App {
                 self.error = None;
                 self.hist_sel = None;
             }
-            KeyCode::Char(c) => {
-                // 只收 URL / 数字能出现的字符
-                if c.is_ascii_alphanumeric() || ":/?.=&-_%#".contains(c) {
-                    self.input.push(c);
-                    self.error = None;
-                    self.hist_sel = None;
-                }
+            KeyCode::Char(c) if c.is_ascii_alphanumeric() || ":/?.=&-_%#".contains(c) => {
+                self.input.push(c);
+                self.error = None;
+                self.hist_sel = None;
             }
             _ => {}
         }
@@ -289,15 +286,11 @@ impl App {
                 }
             }
             KeyCode::Char('q') => self.quit = true,
-            KeyCode::Up | KeyCode::Char('k') => {
-                if n > 0 {
-                    self.sel = (self.sel + n - 1) % n;
-                }
+            KeyCode::Up | KeyCode::Char('k') if n > 0 => {
+                self.sel = (self.sel + n - 1) % n;
             }
-            KeyCode::Down | KeyCode::Char('j') => {
-                if n > 0 {
-                    self.sel = (self.sel + 1) % n;
-                }
+            KeyCode::Down | KeyCode::Char('j') if n > 0 => {
+                self.sel = (self.sel + 1) % n;
             }
             KeyCode::Char('g') => self.sel = 0,
             KeyCode::Char('G') => self.sel = n.saturating_sub(1),
