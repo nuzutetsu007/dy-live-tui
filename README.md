@@ -100,8 +100,8 @@ mpv "$(cat ~/.cache/dy-live-tui/last-url)"
 签名 URL 形如：
 
 ```
-http://pull-hls-e13.douyincdn.com/third/stream-120437108336755582_uhd.m3u8
-    ?expire=1795265854&sign=b13a005c...&arch_hrchy=h1
+http://pull-hls-e13.douyincdn.com/third/stream-<stream_id>_uhd.m3u8
+    ?expire=<unix_ts>&sign=<32位 md5>&arch_hrchy=h1
 ```
 
 `expire` 一般 12 小时左右；主播重开播会换 stream key，旧链接失效——所以播放前尽量一次选好，过期就按 `r` 重新解析。
