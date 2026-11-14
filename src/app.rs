@@ -1,4 +1,5 @@
 use crate::douyin::{self, Candidate, Probe, Room};
+use crate::history::History;
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
@@ -30,6 +31,10 @@ pub struct App {
     pub quit: bool,
     /// (url, mpv window title) —— 由 main 取出后暂停 TUI 去播放
     pub pending_play: Option<(String, String)>,
+    /// 成功播放过的直播间（最近在前）
+    pub history: History,
+    /// 输入页里历史列表的高亮项
+    pub hist_sel: Option<usize>,
     rx: Option<Receiver<Msg>>,
 }
 
@@ -66,8 +71,18 @@ fn probe_many(urls: Vec<String>, tx: &mpsc::Sender<Msg>) {
 
 impl App {
     pub fn new(dry_run: bool, initial: Option<String>) -> Self {
+        let history = History::load();
+        let had_initial = initial.as_ref().is_some_and(|s| !s.trim().is_empty());
+        let mut input = initial.unwrap_or_default();
+        // 没带参数时，直接把上次看过的房间填进输入框，回车即可重新打开
+        let mut hist_sel = None;
+        if !had_initial && !history.is_empty() {
+            input = history.entries()[0].rid.clone();
+            hist_sel = Some(0);
+        }
+
         let mut app = App {
-            input: initial.unwrap_or_default(),
+            input,
             screen: Screen::Input,
             room: None,
             cands: Vec::new(),
@@ -78,9 +93,11 @@ impl App {
             dry_run,
             quit: false,
             pending_play: None,
+            history,
+            hist_sel,
             rx: None,
         };
-        if !app.input.is_empty() {
+        if had_initial {
             app.start_resolve();
         }
         app
@@ -221,23 +238,44 @@ impl App {
         match key.code {
             KeyCode::Enter => self.start_resolve(),
             KeyCode::Esc => self.quit = true,
+            KeyCode::Up => self.pick_history(true),
+            KeyCode::Down => self.pick_history(false),
             KeyCode::Backspace => {
                 self.input.pop();
                 self.error = None;
+                self.hist_sel = None;
             }
             KeyCode::Char('u') if key.modifiers.contains(KeyModifiers::CONTROL) => {
                 self.input.clear();
                 self.error = None;
+                self.hist_sel = None;
             }
             KeyCode::Char(c) => {
                 // 只收 URL / 数字能出现的字符
                 if c.is_ascii_alphanumeric() || ":/?.=&-_%#".contains(c) {
                     self.input.push(c);
                     self.error = None;
+                    self.hist_sel = None;
                 }
             }
             _ => {}
         }
+    }
+
+    /// ↑/↓ 在「最近打开」里选，选中即填入输入框（回车就解析）
+    fn pick_history(&mut self, up: bool) {
+        let n = self.history.entries().len();
+        if n == 0 {
+            return;
+        }
+        let idx = match self.hist_sel {
+            None => 0,
+            Some(i) if up => (i + n - 1) % n,
+            Some(i) => (i + 1) % n,
+        };
+        self.hist_sel = Some(idx);
+        self.input = self.history.entries()[idx].rid.clone();
+        self.error = None;
     }
 
     fn key_quality(&mut self, key: KeyEvent) {
@@ -309,12 +347,98 @@ impl App {
         self.error = None;
     }
 
-    /// mpv 退出后的状态回写
+    /// mpv 退出后的状态回写；只有真正播放成功（退出码 0）才记入历史
     pub fn on_play_done(&mut self, res: std::io::Result<std::process::ExitStatus>) {
+        let ok = matches!(&res, Ok(st) if st.success());
         self.msg = match res {
-            Ok(st) if st.success() => "mpv 退出（0）".to_string(),
+            Ok(st) if st.success() => "已关闭 mpv（0）· 已记入历史".to_string(),
             Ok(st) => format!("mpv 退出码 {:?}", st.code()),
             Err(e) => format!("启动 mpv 失败: {e}"),
         };
+        if ok {
+            if let Some(r) = &self.room {
+                let (rid, nick, title) = (r.rid.clone(), r.nick.clone(), r.title.clone());
+                self.history.add(&rid, &nick, &title);
+                self.hist_sel = Some(0);
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::os::unix::process::ExitStatusExt;
+
+    fn exit(code: i32) -> std::process::ExitStatus {
+        std::process::ExitStatus::from_raw(code << 8)
+    }
+
+    fn tmp_history() -> (App, std::path::PathBuf) {
+        let path = std::env::temp_dir().join(format!(
+            "dy-app-hist-{}-{}.tsv",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let _ = std::fs::remove_file(&path);
+        let mut app = App::new(false, None);
+        app.history = History::load_from(&path);
+        app.room = Some(Room {
+            rid: "456497901213".into(),
+            nick: "主播杨树".into(),
+            title: "全新3D僵尸毁灭工程".into(),
+            online: "3000+".into(),
+            status: 2,
+        });
+        (app, path)
+    }
+
+    #[test]
+    fn success_records_history() {
+        let (mut app, path) = tmp_history();
+        app.on_play_done(Ok(exit(0)));
+        assert_eq!(app.history.entries().len(), 1);
+        assert_eq!(app.history.entries()[0].rid, "456497901213");
+        assert_eq!(app.history.entries()[0].nick, "主播杨树");
+        assert_eq!(app.hist_sel, Some(0));
+        assert!(app.msg.contains("历史"));
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn failure_does_not_record_history() {
+        let (mut app, path) = tmp_history();
+        app.on_play_done(Ok(exit(1)));
+        assert!(app.history.entries().is_empty(), "失败不该记入历史");
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[test]
+    fn history_pick_fills_input() {
+        let (mut app, path) = tmp_history();
+        app.history.add("111111", "A", "a");
+        app.history.add("222222", "B", "b");
+        app.screen = Screen::Input;
+        app.hist_sel = None;
+
+        app.pick_history(true);
+        assert_eq!(app.input, "222222", "↑ 从最新一条开始");
+        assert_eq!(app.hist_sel, Some(0));
+
+        app.pick_history(false);
+        assert_eq!(app.input, "111111");
+        assert_eq!(app.hist_sel, Some(1));
+
+        // 打字后脱离历史选择
+        app.handle_key(crossterm::event::KeyEvent::new(
+            crossterm::event::KeyCode::Char('9'),
+            crossterm::event::KeyModifiers::NONE,
+        ));
+        assert_eq!(app.hist_sel, None);
+        assert_eq!(app.input, "1111119");
+        let _ = std::fs::remove_file(&path);
     }
 }

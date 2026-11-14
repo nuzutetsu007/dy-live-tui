@@ -7,11 +7,12 @@
 ┌ dy-live TUI ────────────────────────────────────────────────┐
 │ ▶ 主播杨树 · 全新3D僵尸毁灭工程   (在线 3000+)               │
 ├─────────────────────────────────────────────────────────────┤
-│ 清晰度             协议   连通    延迟      直链              │
-│ FULL_HD1 蓝光      HLS    ✓ 200   271 ms   pull-hls-e13/...  │
-│ FULL_HD1 蓝光      FLV    ✓ 200   283 ms   pull-flv-e13/...  │
-│ HD1 高清           HLS    ✓ 200  3348 ms   pull-hls-e13/...  │
-│ SD2 标清           FLV    ✓ 200   402 ms   pull-flv-e13/...  │
+│ 质量        分辨率        协议  连通    延迟     直链        │
+│ 原画        1920x1080@60  HLS   ✓ 200   295 ms   _or4.m3u8   │
+│ 原画        1920x1080@60  FLV   ✓ 200   325 ms   _or4.flv    │
+│ 蓝光        1920x1080@45  HLS   ✓ 200   338 ms   _uhd.m3u8   │
+│ 超清        1280x720@30   FLV   ✓ 200   312 ms   _hd.flv     │
+│ 标清        960x540@25    HLS   ✓ 200  1377 ms   _ld.m3u8    │
 ├─────────────────────────────────────────────────────────────┤
 │ ↑/↓ 选择  Enter 播放  f 强制播放  p 重测  r 重解析  q 退出   │
 └─────────────────────────────────────────────────────────────┘
@@ -51,6 +52,7 @@ mpv "$(cat ~/.cache/dy-live-tui/last-url)"
 | 页面 | 按键 | 作用 |
 | --- | --- | --- |
 | 输入 | `Enter` | 解析 |
+| 输入 | `↑` `↓` | 在「最近打开」里选择（自动填入输入框） |
 | 输入 | `Ctrl-U` | 清空输入 |
 | 输入 | `Esc` | 退出 |
 | 加载 | `Esc` / `q` | 取消解析 |
@@ -64,15 +66,36 @@ mpv "$(cat ~/.cache/dy-live-tui/last-url)"
 
 支持括号粘贴（bracketed paste），链接里带 `?enter_from=...` 也能识别。
 
+## 历史记录
+
+只记录**用 mpv 成功打开过**（退出码 0）的直播间，保存在
+`~/.cache/dy-live-tui/history.tsv`，最近 12 条，同房间自动去重并挪到最前。
+
+```
+最近打开  ↑/↓ 选择，回车重新打开
+❯ 456497901213  主播杨树 · 全新3D僵尸毁灭工程
+  123456789     某人 · 标题B
+```
+
+启动时如果没带参数，会把上次看的房间号直接填进输入框——**按一次回车就能重看**。
+`--dry-run` 不会写入历史，解析失败/下播/播放失败也不会。
+
+清空历史：`rm ~/.cache/dy-live-tui/history.tsv`。
+
 ## 原理
 
 1. `GET https://live.douyin.com/<rid>`，顺手拿 `ttwid` cookie（可选，拿不到也继续）。
 2. `GET https://live.douyin.com/webcast/room/web/enter/?...&web_rid=<rid>`
    → `data.data[0].stream_url` 里的 `hls_pull_url_map` / `flv_pull_url`，**只有这里返回的地址带 `sign`**。
    页面 HTML 内嵌的地址没有签名，直接拉会被 CDN 403，所以不能从页面正则抠地址。
-3. 按 `FULL_HD1 → HD1 → SD2 → SD1` 排序，每档 HLS 优先、FLV 兜底，按 URL 去重。
-4. 每条直链发 `Range: bytes=0-2047` 请求探测（只看状态码，不下载内容），4 路并发。
-5. 选中后暂停 TUI（退出 alternate screen）→ `mpv --ytdl=no --force-media-title=... <url>` → mpv 退出后恢复 TUI。
+3. 优先读 `stream_url.live_core_sdk_data.pull_data` 里的完整档位表：
+   `options.qualities` 给出 sdk_key / 中文名 / 分辨率 / 帧率 / level，
+   `stream_data`（一个 JSON 字符串）给出各档的 `hls` / `flv` 地址。
+   这里比老的 `hls_pull_url_map` 多出 **原画（`origin` / `_or4`，1080p 60fps）**，
+   实测约 15 Mbps；老房间没有这份数据时退回 `hls_pull_url_map`（`FULL_HD1` 即蓝光 45fps）。
+4. 按 `level` 从高到低排序（原画 → 蓝光 → 超清 → 高清 → 标清），每档 HLS 优先、FLV 兜底，按 URL 去重。
+5. 每条直链发 `Range: bytes=0-2047` 请求探测（只看状态码，不下载内容），4 路并发。
+6. 选中后暂停 TUI（退出 alternate screen）→ `mpv --ytdl=no --force-media-title=... <url>` → mpv 退出后恢复 TUI，退出码为 0 才记入历史。
 
 签名 URL 形如：
 
@@ -101,6 +124,9 @@ cat ~/.cache/dy-live-tui/last-url
 
 ## 已知限制
 
+- **编码只有 H.264**：`stream_url.extra` 里 `h265_enable` / `bytevc1_enable` 都是 false，
+  `options.qualities[].v_codec` 全是 `264`；换 `support_h265=1` / `v_codec=265` 也不会变。
+  是否给 H.265 取决于主播推流和平台转码，web 接口这一路基本只发 H.264；AV1 直播拉流目前没有。
 - 只支持普通直播间；VR、连麦、付费等模式 web 端接口可能不给 `stream_url`。
 - 风控（`status=0` 且无数据）时只能重试，或挂上浏览器里的 cookie。
 - 播放交给系统 mpv，若 `~/.config/mpv/mpv.conf` 里有 `fs=yes` 会全屏；mpv 载入失败时不会开窗，看它的 stderr 即可。

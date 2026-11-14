@@ -1,5 +1,6 @@
 mod app;
 mod douyin;
+mod history;
 mod ui;
 
 use app::{App, Screen};
@@ -28,8 +29,12 @@ dy-live-tui — 抖音直播间 → 直链 → mpv
   -V, --version          版本
 
 TUI 内按键:
-  输入页   Enter 解析    Ctrl-U 清空    Esc 退出
+  输入页   Enter 解析   ↑/↓ 选最近打开   Ctrl-U 清空   Esc 退出
   列表页   ↑/↓ 或 j/k 选择   Enter 播放   f 强制播放   p 重测   r 重解析   Esc 返回   q 退出
+
+历史:
+  只记录用 mpv 成功打开过的直播间，存在 ~/.cache/dy-live-tui/history.tsv（最近 12 条）。
+  启动时自动填入上次的房间号，回车即可重看；↑/↓ 可在最近列表里切换。
 ";
 
 fn init() -> io::Result<Term> {
@@ -58,13 +63,7 @@ fn restore(term: &mut Term) -> io::Result<()> {
 }
 
 fn cache_path(name: &str) -> std::path::PathBuf {
-    let base = std::env::var_os("XDG_CACHE_HOME")
-        .map(std::path::PathBuf::from)
-        .unwrap_or_else(|| {
-            let home = std::env::var_os("HOME").unwrap_or_default();
-            std::path::PathBuf::from(home).join(".cache")
-        });
-    base.join("dy-live-tui").join(name)
+    history::cache_dir().join(name)
 }
 
 fn print_resolve(rid: &str) -> io::Result<()> {
@@ -82,9 +81,17 @@ fn print_resolve(rid: &str) -> io::Result<()> {
                 } else {
                     format!("err {:>3}", p.code)
                 };
+                let res = if c.res.is_empty() {
+                    "-".to_string()
+                } else if c.fps > 0 {
+                    format!("{}@{}", c.res, c.fps)
+                } else {
+                    c.res.clone()
+                };
                 println!(
-                    "{:<7} {:<4} {} {:>5}ms  {}",
-                    c.quality,
+                    "{:<6} {:<13} {:<4} {} {:>5}ms  {}",
+                    c.display_name(),
+                    res,
                     c.proto.as_str(),
                     mark,
                     p.ms,

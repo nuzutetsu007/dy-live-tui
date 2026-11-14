@@ -2,17 +2,6 @@ use crate::app::{App, Screen};
 use ratatui::prelude::*;
 use ratatui::widgets::{Block, Borders, Cell, Paragraph, Row, Table, Wrap};
 
-/// 质量档 → 中文名
-fn quality_cn(q: &str) -> &'static str {
-    match q {
-        "FULL_HD1" => "蓝光",
-        "HD1" => "高清",
-        "SD2" => "标清",
-        "SD1" => "流畅",
-        _ => "其他",
-    }
-}
-
 fn short_url(url: &str) -> String {
     let base = url.split('?').next().unwrap_or(url);
     let base = base
@@ -115,6 +104,27 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         )));
     }
 
+    if !app.history.is_empty() {
+        lines.push(Line::from(""));
+        lines.push(Line::from(Span::styled(
+            "最近打开  ↑/↓ 选择，回车重新打开",
+            Style::default().fg(Color::DarkGray),
+        )));
+        for (i, e) in app.history.entries().iter().take(5).enumerate() {
+            let selected = app.hist_sel == Some(i);
+            let style = if selected {
+                Style::default().fg(Color::Black).bg(Color::Red)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            let marker = if selected { "❯ " } else { "  " };
+            lines.push(Line::from(Span::styled(
+                format!("{marker}{:<12} {}", e.rid, e.summary(46)),
+                style,
+            )));
+        }
+    }
+
     let block = Block::default()
         .title(Span::styled(" 输入 ", Style::default().fg(Color::DarkGray)))
         .borders(Borders::ALL)
@@ -149,6 +159,7 @@ fn draw_loading(f: &mut Frame, app: &App, area: Rect) {
 fn draw_quality(f: &mut Frame, app: &App, area: Rect) {
     let header = Row::new(vec![
         Cell::from("质量"),
+        Cell::from("分辨率"),
         Cell::from("协议"),
         Cell::from("连通"),
         Cell::from("延迟"),
@@ -181,7 +192,14 @@ fn draw_quality(f: &mut Frame, app: &App, area: Rect) {
             } else {
                 format!("{} ms", c.probe.ms)
             };
-            let q = format!("{} {}", c.quality, quality_cn(&c.quality));
+            let q = c.display_name();
+            let res = if c.res.is_empty() {
+                "-".to_string()
+            } else if c.fps > 0 {
+                format!("{}@{}", c.res, c.fps)
+            } else {
+                c.res.clone()
+            };
             let style = if i == app.sel {
                 Style::default().fg(Color::Black).bg(Color::Red)
             } else {
@@ -189,6 +207,7 @@ fn draw_quality(f: &mut Frame, app: &App, area: Rect) {
             };
             Row::new(vec![
                 Cell::from(q),
+                Cell::from(res).style(Style::default().fg(Color::Gray)),
                 Cell::from(c.proto.as_str()),
                 Cell::from(mark).style(Style::default().fg(color)),
                 Cell::from(latency),
@@ -199,7 +218,8 @@ fn draw_quality(f: &mut Frame, app: &App, area: Rect) {
         .collect();
 
     let widths = [
-        Constraint::Length(13),
+        Constraint::Length(12),
+        Constraint::Length(14),
         Constraint::Length(4),
         Constraint::Length(7),
         Constraint::Length(8),
@@ -227,7 +247,7 @@ fn draw_quality(f: &mut Frame, app: &App, area: Rect) {
 
 fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
     let keys = match app.screen {
-        Screen::Input => "Enter 解析   Ctrl-U 清空   Esc 退出",
+        Screen::Input => "Enter 解析   ↑/↓ 最近打开   Ctrl-U 清空   Esc 退出",
         Screen::Loading => "Esc 取消",
         Screen::Quality => {
             "↑/↓ 选择   Enter 播放   f 强制播放   p 重测   r 重解析   Esc 返回   q 退出"
@@ -294,5 +314,23 @@ mod tests {
             compact(&raw).contains("房间号或链接不对"),
             "error not shown:\n{raw}"
         );
+    }
+
+    #[test]
+    fn input_screen_shows_history() {
+        let mut app = App::new(false, None);
+        let path = std::env::temp_dir().join(format!("dy-ui-hist-{}.tsv", std::process::id()));
+        let _ = std::fs::remove_file(&path);
+        let mut h = crate::history::History::load_from(&path);
+        h.add("456497901213", "主播杨树", "全新3D僵尸毁灭工程");
+        app.history = h;
+        app.input = "456497901213".into();
+        app.hist_sel = Some(0);
+
+        let s = compact(&render(&app, 80, 20));
+        assert!(s.contains("最近打开"), "history title missing");
+        assert!(s.contains("主播杨树"), "history row missing");
+        assert!(s.contains("❯"), "selected marker missing");
+        let _ = std::fs::remove_file(&path);
     }
 }

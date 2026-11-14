@@ -60,7 +60,14 @@ impl Probe {
 
 #[derive(Clone, Debug)]
 pub struct Candidate {
+    /// 接口里的档位 key，如 `origin` / `FULL_HD1`
     pub quality: String,
+    /// 中文档位名，如「原画」「蓝光」（老接口没有这个字段时为空）
+    pub name: String,
+    /// 分辨率，如 `1920x1080`
+    pub res: String,
+    /// 该档位标称帧率，0 表示未知
+    pub fps: u32,
     pub proto: Proto,
     pub url: String,
     pub probe: Probe,
@@ -68,7 +75,38 @@ pub struct Candidate {
 
 impl Candidate {
     pub fn label(&self) -> String {
-        format!("{} {}", self.quality, self.proto.as_str())
+        let mut s = self.display_name();
+        if !self.res.is_empty() {
+            s.push(' ');
+            s.push_str(&self.res);
+            if self.fps > 0 {
+                s.push_str(&format!("@{}fps", self.fps));
+            }
+        }
+        s.push(' ');
+        s.push_str(self.proto.as_str());
+        s
+    }
+
+    /// 中文名优先；没有就用 key + 映射
+    pub fn display_name(&self) -> String {
+        if !self.name.is_empty() {
+            self.name.clone()
+        } else {
+            format!("{} {}", self.quality, quality_cn(&self.quality))
+        }
+    }
+}
+
+/// 老接口的档位 key → 中文
+pub fn quality_cn(q: &str) -> &'static str {
+    match q {
+        "origin" => "原画",
+        "FULL_HD1" => "蓝光",
+        "HD1" => "高清",
+        "SD2" => "标清",
+        "SD1" => "流畅",
+        _ => "",
     }
 }
 
@@ -131,7 +169,16 @@ fn str_at(v: &Value, key: &str) -> Option<String> {
     v.get(key).and_then(|x| x.as_str()).map(|s| s.to_string())
 }
 
-fn push_cand(list: &mut Vec<Candidate>, quality: &str, proto: Proto, url: Option<String>) {
+#[allow(clippy::too_many_arguments)]
+fn push_cand(
+    list: &mut Vec<Candidate>,
+    quality: &str,
+    name: &str,
+    res: &str,
+    fps: u32,
+    proto: Proto,
+    url: Option<String>,
+) {
     let Some(url) = url else { return };
     if url.is_empty() {
         return;
@@ -141,10 +188,93 @@ fn push_cand(list: &mut Vec<Candidate>, quality: &str, proto: Proto, url: Option
     }
     list.push(Candidate {
         quality: quality.to_string(),
+        name: name.to_string(),
+        res: res.to_string(),
+        fps,
         proto,
         url,
         probe: Probe::PENDING,
     });
+}
+
+/// 新版接口：`stream_url.live_core_sdk_data.pull_data` 里有完整档位表，
+/// 比 `hls_pull_url_map` 多出「原画（origin / _or4，60fps）」，并带中文名、分辨率、帧率。
+/// 返回的列表按 level 从高到低（原画在最前），每档 HLS 在前、FLV 在后。
+fn sdk_candidates(stream: &Value) -> Vec<Candidate> {
+    let pull = &stream["live_core_sdk_data"]["pull_data"];
+    let Some(qualities) = pull["options"]["qualities"].as_array() else {
+        return Vec::new();
+    };
+    let Some(stream_data) = pull["stream_data"]
+        .as_str()
+        .and_then(|s| serde_json::from_str::<Value>(s).ok())
+    else {
+        return Vec::new();
+    };
+    let Some(data) = stream_data["data"].as_object() else {
+        return Vec::new();
+    };
+
+    // (level, name, res, fps, key)
+    let mut tiers: Vec<(i64, String, String, u32, String)> = Vec::new();
+    for q in qualities {
+        let key = str_at(q, "sdk_key").unwrap_or_default();
+        if key.is_empty() || q["disable"].as_i64().unwrap_or(0) != 0 {
+            continue;
+        }
+        let Some(node) = data.get(&key) else { continue };
+        let main = &node["main"];
+        if str_at(main, "hls").is_none() && str_at(main, "flv").is_none() {
+            continue;
+        }
+        let name = str_at(q, "name").unwrap_or_else(|| key.clone());
+        // 少数房间给 H.265，标出来（mpv 能放，但用户应该知道）
+        let codec = str_at(q, "v_codec").unwrap_or_default();
+        let name = if codec.is_empty() || codec == "264" {
+            name
+        } else {
+            format!(
+                "{name} H.{}",
+                if codec == "265" {
+                    "265"
+                } else {
+                    codec.as_str()
+                }
+            )
+        };
+        tiers.push((
+            q["level"].as_i64().unwrap_or(0),
+            name,
+            str_at(q, "resolution").unwrap_or_default(),
+            q["fps"].as_u64().unwrap_or(0) as u32,
+            key,
+        ));
+    }
+    tiers.sort_by(|a, b| b.0.cmp(&a.0));
+
+    let mut list = Vec::new();
+    for (_, name, res, fps, key) in tiers {
+        let main = &data[&key]["main"];
+        push_cand(
+            &mut list,
+            &key,
+            &name,
+            &res,
+            fps,
+            Proto::Hls,
+            str_at(main, "hls"),
+        );
+        push_cand(
+            &mut list,
+            &key,
+            &name,
+            &res,
+            fps,
+            Proto::Flv,
+            str_at(main, "flv"),
+        );
+    }
+    list
 }
 
 /// 解析直播间，返回房间信息 + 候选直链（HLS 优先、按请求质量在前的顺序排列）
@@ -209,31 +339,39 @@ pub fn resolve(rid: &str) -> Result<(Room, Vec<Candidate>), String> {
     let hls_map = &stream["hls_pull_url_map"];
     let flv_map = &stream["flv_pull_url"];
 
-    // 质量顺序：请求的档位 → 其余档位（含接口额外给的档位）
-    let mut order: Vec<String> = QUALITIES.iter().map(|q| q.to_string()).collect();
-    for map in [hls_map, flv_map] {
-        if let Some(obj) = map.as_object() {
-            for k in obj.keys() {
-                let k = k.to_string();
-                if !order.contains(&k) {
-                    order.push(k);
+    // 优先用新版档位表（含原画 60fps）；老房间没有就退回 hls_pull_url_map
+    let mut cands = sdk_candidates(stream);
+
+    if cands.is_empty() {
+        // 质量顺序：请求的档位 → 其余档位（含接口额外给的档位）
+        let mut order: Vec<String> = QUALITIES.iter().map(|q| q.to_string()).collect();
+        for map in [hls_map, flv_map] {
+            if let Some(obj) = map.as_object() {
+                for k in obj.keys() {
+                    let k = k.to_string();
+                    if !order.contains(&k) {
+                        order.push(k);
+                    }
                 }
             }
         }
-    }
 
-    let mut cands = Vec::new();
-    for q in &order {
-        push_cand(&mut cands, q, Proto::Hls, str_at(hls_map, q));
-        push_cand(&mut cands, q, Proto::Flv, str_at(flv_map, q));
+        for q in &order {
+            let cn = quality_cn(q);
+            push_cand(&mut cands, q, cn, "", 0, Proto::Hls, str_at(hls_map, q));
+            push_cand(&mut cands, q, cn, "", 0, Proto::Flv, str_at(flv_map, q));
+        }
+        // 兜底：顶层单一 hls 地址
+        push_cand(
+            &mut cands,
+            "default",
+            "",
+            "",
+            0,
+            Proto::Hls,
+            str_at(stream, "hls_pull_url"),
+        );
     }
-    // 兜底：顶层单一 hls 地址
-    push_cand(
-        &mut cands,
-        "default",
-        Proto::Hls,
-        str_at(stream, "hls_pull_url"),
-    );
 
     if cands.is_empty() {
         return Err("没解析到任何拉流地址（VR / 连麦等模式 web 端可能不支持）".into());
@@ -325,6 +463,51 @@ mod tests {
         }
         .ok());
         assert!(!Probe::PENDING.ok());
+    }
+
+    #[test]
+    fn sdk_ladder_prefers_origin() {
+        let stream_data = serde_json::json!({
+            "data": {
+                "ld":  { "main": { "hls": "http://x/ld.m3u8",  "flv": "http://x/ld.flv" } },
+                "hd":  { "main": { "hls": "http://x/hd.m3u8",  "flv": "http://x/hd.flv" } },
+                "uhd": { "main": { "hls": "http://x/uhd.m3u8", "flv": "" } },
+                "origin": { "main": { "hls": "http://x/or4.m3u8", "flv": "http://x/or4.flv" } }
+            }
+        })
+        .to_string();
+        let stream = serde_json::json!({
+            "live_core_sdk_data": {
+                "pull_data": {
+                    "options": {
+                        "qualities": [
+                            { "name": "标清", "sdk_key": "ld",  "v_codec": "264", "resolution": "960x540",  "level": 1, "fps": 25, "disable": 0 },
+                            { "name": "超清", "sdk_key": "hd",  "v_codec": "265", "resolution": "1280x720", "level": 3, "fps": 30, "disable": 0 },
+                            { "name": "蓝光", "sdk_key": "uhd", "v_codec": "264", "resolution": "1920x1080","level": 4, "fps": 45, "disable": 0 },
+                            { "name": "原画", "sdk_key": "origin", "v_codec": "264", "resolution": "1920x1080", "level": 5, "fps": 59, "disable": 0 }
+                        ]
+                    },
+                    "stream_data": stream_data
+                }
+            }
+        });
+
+        let cands = sdk_candidates(&stream);
+        assert_eq!(cands.len(), 7, "4 档 × 2 协议 - 1 个空 flv");
+        assert_eq!(cands[0].quality, "origin");
+        assert_eq!(cands[0].proto, Proto::Hls);
+        assert_eq!(cands[0].name, "原画");
+        assert_eq!(cands[0].res, "1920x1080");
+        assert_eq!(cands[0].fps, 59);
+        assert_eq!(cands[1].quality, "origin");
+        assert_eq!(cands[1].proto, Proto::Flv);
+        // H.265 档位要标出来
+        let hd = cands.iter().find(|c| c.quality == "hd").unwrap();
+        assert!(hd.name.contains("H.265"), "name = {}", hd.name);
+        // uhd 只有 hls，不该出现 flv
+        assert!(!cands
+            .iter()
+            .any(|c| c.quality == "uhd" && c.proto == Proto::Flv));
     }
 
     /// 真实网络集成测试：`cargo test -- --ignored`
