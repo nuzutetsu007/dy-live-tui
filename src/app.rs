@@ -6,11 +6,27 @@ use std::sync::mpsc::{self, Receiver, TryRecvError};
 use std::thread;
 
 pub enum Msg {
-    Found { room: Room, cands: Vec<Candidate> },
-    Probed { idx: usize, probe: Probe },
+    Found {
+        room: Room,
+        cands: Vec<Candidate>,
+    },
+    Probed {
+        idx: usize,
+        probe: Probe,
+    },
     Failed(String),
-    Discovered { key: String, rooms: Vec<RoomCard> },
-    DiscoverFailed { key: String, err: String },
+    Discovered {
+        key: String,
+        page: discover::Page,
+        /// 是否追加到当前列表（`r` 下一批）
+        append: bool,
+        /// 是否从第 1 页重来（`R`，会清空本分区已看记录）
+        fresh: bool,
+    },
+    DiscoverFailed {
+        key: String,
+        err: String,
+    },
     Done,
 }
 
@@ -26,12 +42,24 @@ pub enum Screen {
 #[derive(Default)]
 pub struct Discover {
     pub sel: usize,
+    /// 游戏子分区下标：0=综合，1..=GAME_SUBS.len()
+    pub sub: usize,
     pub rooms: Vec<RoomCard>,
     pub cursor: usize,
     pub loading: bool,
     pub err: Option<String>,
-    /// 已拉取（或正在拉取）的分区 key，用于避免重复请求
+    /// 已拉取（或正在拉取）的分区 key，用于避免重复请求/丢弃过期响应
     pub loaded_key: Option<String>,
+    /// 下一页请求的 offset
+    pub offset: usize,
+    /// 是否已经到接口的 200 个上限
+    pub exhausted: bool,
+    /// 是否退回了 15 个热门房间的 SSR 兜底
+    pub fallback: bool,
+    /// 人数升序（默认降序）
+    pub sort_asc: bool,
+    /// 本会话里每个分区已经展示过的房间号（只在内存里，不落盘）
+    pub seen: std::collections::HashMap<String, std::collections::HashSet<String>>,
 }
 
 pub struct App {
@@ -185,49 +213,256 @@ impl App {
     pub fn open_discover(&mut self) {
         self.error = None;
         self.screen = Screen::Discover;
-        let key = discover::CATEGORIES[self.discover.sel].key;
-        if self.discover.loaded_key.as_deref() != Some(key) {
-            self.load_category(self.discover.sel, false);
+        let (key, _, _, _) = self.current_partition();
+        if self.discover.loaded_key.as_deref() != Some(key.as_str()) {
+            self.load_current(false);
         }
     }
 
-    /// 拉取某个分区的房间（force 为 true 时绕过缓存）
+    /// 当前选中的分区：key、partition id、partition type、展示名
+    fn current_partition(&self) -> (String, &'static str, &'static str, String) {
+        let cat = discover::CATEGORIES[self.discover.sel];
+        if cat.key == "4_103" && self.discover.sub > 0 {
+            let sub = discover::GAME_SUBS[self.discover.sub - 1];
+            (
+                format!("{}:{}", cat.key, sub.id),
+                sub.id,
+                sub.ptype,
+                format!("{} · {}", cat.name, sub.name),
+            )
+        } else if cat.key == "4_103" {
+            (
+                cat.key.to_string(),
+                cat.id,
+                "4",
+                format!("{} · 综合", cat.name),
+            )
+        } else {
+            (cat.key.to_string(), cat.id, "4", cat.name.to_string())
+        }
+    }
+
+    /// 当前分区展示名（给 UI 标题用）
+    pub fn discover_label(&self) -> String {
+        self.current_partition().3
+    }
+
+    /// 切到某个一级分区（`force` 为 true 时清空已看记录、绕过缓存）
     fn load_category(&mut self, idx: usize, force: bool) {
         let idx = idx.min(discover::CATEGORIES.len() - 1);
-        let cat = discover::CATEGORIES[idx];
+        if idx != self.discover.sel {
+            self.discover.sub = 0;
+        }
         self.discover.sel = idx;
+        self.load_current(force);
+    }
+
+    /// 从第 1 页拉当前分区（会清空列表）
+    fn load_current(&mut self, force: bool) {
+        let (key, id, ptype, label) = self.current_partition();
         self.discover.rooms.clear();
         self.discover.cursor = 0;
+        self.discover.offset = 0;
+        self.discover.exhausted = false;
+        self.discover.fallback = false;
         self.discover.err = None;
         self.discover.loading = true;
-        self.discover.loaded_key = Some(cat.key.to_string());
-        self.msg = format!("拉取「{}」分区…", cat.name);
+        self.discover.loaded_key = Some(key.clone());
+        if force {
+            self.discover.seen.remove(&key);
+        }
+        self.msg = if force {
+            format!("重新拉取「{label}」…")
+        } else {
+            format!("拉取「{label}」…")
+        };
+        self.spawn_page(key, id, ptype, 0, false, force);
+    }
 
+    /// `r`：拉下一页，追加到当前列表
+    fn load_more(&mut self) {
+        if self.discover.loading {
+            return;
+        }
+        let (key, id, ptype, label) = self.current_partition();
+        if self.discover.loaded_key.as_deref() != Some(key.as_str()) {
+            self.load_current(false);
+            return;
+        }
+        if self.discover.fallback {
+            self.msg = format!("「{label}」当前是热榜回退数据，不能翻页；按 R 重试签名接口");
+            return;
+        }
+        if self.discover.exhausted {
+            self.msg = format!("「{label}」已看完（{} 个）", self.discover.rooms.len());
+            return;
+        }
+        let offset = self.discover.offset;
+        self.discover.loading = true;
+        self.discover.err = None;
+        self.msg = format!("拉取「{label}」下一批…");
+        self.spawn_page(key, id, ptype, offset, true, false);
+    }
+
+    /// 游戏子分区切换：0=综合，1..=GAME_SUBS.len()
+    fn change_sub(&mut self, delta: isize) {
+        if self.discover.sel != 2 {
+            self.msg = "只有「游戏」分区有子分区".into();
+            return;
+        }
+        let max = discover::GAME_SUBS.len() as isize;
+        let next = (self.discover.sub as isize + delta).clamp(0, max) as usize;
+        if next == self.discover.sub {
+            return;
+        }
+        self.discover.sub = next;
+        self.load_current(false);
+    }
+
+    fn toggle_sort(&mut self) {
+        self.discover.sort_asc = !self.discover.sort_asc;
+        self.sort_rooms(None);
+        self.msg = if self.discover.sort_asc {
+            "人数升序：小主播在前".into()
+        } else {
+            "人数降序：大主播在前".into()
+        };
+    }
+
+    fn sort_rooms(&mut self, keep: Option<String>) {
+        let keep = keep.or_else(|| {
+            self.discover
+                .rooms
+                .get(self.discover.cursor)
+                .map(|r| r.rid.clone())
+        });
+        let asc = self.discover.sort_asc;
+        self.discover.rooms.sort_by(|a, b| {
+            let ord = a.viewers.cmp(&b.viewers);
+            if asc {
+                ord
+            } else {
+                ord.reverse()
+            }
+        });
+        self.discover.cursor = keep
+            .and_then(|rid| self.discover.rooms.iter().position(|r| r.rid == rid))
+            .unwrap_or(0);
+    }
+
+    fn spawn_page(
+        &mut self,
+        key: String,
+        id: &'static str,
+        ptype: &'static str,
+        offset: usize,
+        append: bool,
+        fresh: bool,
+    ) {
         let (tx, rx) = mpsc::channel();
         self.rx = Some(rx);
-        let key = cat.key.to_string();
 
         // 单测里不发真实请求，保证测试离线、可重复
         if cfg!(test) {
             let _ = tx.send(Msg::Discovered {
                 key,
-                rooms: Vec::new(),
+                page: discover::Page::default(),
+                append,
+                fresh,
             });
             return;
         }
 
         thread::spawn(move || {
-            let result = if force {
-                discover::fetch_fresh(&key)
-            } else {
-                discover::fetch(&key)
-            };
-            let msg = match result {
-                Ok(rooms) => Msg::Discovered { key, rooms },
+            // `R` 既清空已看记录，也绕过缓存；其余情况走 5 分钟缓存。
+            let msg = match discover::fetch_page(&key, id, ptype, offset, fresh) {
+                Ok(page) => Msg::Discovered {
+                    key,
+                    page,
+                    append,
+                    fresh,
+                },
                 Err(err) => Msg::DiscoverFailed { key, err },
             };
             let _ = tx.send(msg);
         });
+    }
+
+    /// 把一页结果放进界面：`append` 追加，否则替换；`fresh` 先清空已看记录。
+    fn apply_page(&mut self, key: String, page: discover::Page, append: bool, fresh: bool) {
+        let label = self.current_partition().3;
+        let raw_count = page.rooms.len();
+        let mut first_added: Option<String> = None;
+
+        let key_seen = self.discover.seen.entry(key).or_default();
+        if fresh {
+            key_seen.clear();
+        }
+
+        let mut added = 0usize;
+        if append {
+            let mut existing: std::collections::HashSet<String> =
+                self.discover.rooms.iter().map(|r| r.rid.clone()).collect();
+            for room in page.rooms {
+                if !existing.insert(room.rid.clone()) {
+                    continue;
+                }
+                if first_added.is_none() {
+                    first_added = Some(room.rid.clone());
+                }
+                key_seen.insert(room.rid.clone());
+                self.discover.rooms.push(room);
+                added += 1;
+            }
+        } else {
+            let mut dedup = std::collections::HashSet::new();
+            let mut rooms = Vec::with_capacity(raw_count);
+            for room in page.rooms {
+                if !dedup.insert(room.rid.clone()) {
+                    continue;
+                }
+                key_seen.insert(room.rid.clone());
+                rooms.push(room);
+            }
+            added = rooms.len();
+            self.discover.rooms = rooms;
+            self.discover.cursor = 0;
+        }
+
+        self.discover.offset = page.next_offset;
+        self.discover.exhausted = page.exhausted;
+        self.discover.fallback = page.fallback;
+        self.discover.loading = false;
+        self.discover.err = None;
+
+        let keep = if append { first_added } else { None };
+        self.sort_rooms(keep);
+
+        let total = self.discover.rooms.len();
+        let suffix = if self.discover.exhausted {
+            " · 已看完"
+        } else {
+            ""
+        };
+        self.msg = if fresh {
+            format!("「{label}」已从第 1 页重来 · {total} 个{suffix}")
+        } else if append {
+            if added == 0 {
+                format!("「{label}」这一批都是已看过的 · 按 r 继续{suffix}")
+            } else {
+                format!(
+                    "「{label}」新增 {added} 个 · 已看 {total}/{}{suffix}",
+                    discover::MAX_ROOMS
+                )
+            }
+        } else if page.fallback {
+            format!("「{label}」签名接口失败，已回退热榜 {total} 个 · 只能看这一批")
+        } else {
+            format!(
+                "「{label}」{total} 个 · 已看 {total}/{}{suffix} · r 下一批",
+                discover::MAX_ROOMS
+            )
+        };
     }
 
     fn key_discover(&mut self, key: KeyEvent) {
@@ -245,6 +480,8 @@ impl App {
             {
                 self.load_category(self.discover.sel + 1, false);
             }
+            KeyCode::Char('[') => self.change_sub(-1),
+            KeyCode::Char(']') => self.change_sub(1),
             KeyCode::Up | KeyCode::Char('k') if n > 0 => {
                 self.discover.cursor = self.discover.cursor.saturating_sub(1);
             }
@@ -253,7 +490,9 @@ impl App {
             }
             KeyCode::Char('g') => self.discover.cursor = 0,
             KeyCode::Char('G') => self.discover.cursor = n.saturating_sub(1),
-            KeyCode::Char('r') => self.load_category(self.discover.sel, true),
+            KeyCode::Char('s') => self.toggle_sort(),
+            KeyCode::Char('r') => self.load_more(),
+            KeyCode::Char('R') => self.load_current(true),
             KeyCode::Enter => {
                 if let Some(room) = self.discover.rooms.get(self.discover.cursor) {
                     self.input = room.rid.clone();
@@ -310,16 +549,15 @@ impl App {
                     self.rx = None;
                     return;
                 }
-                Ok(Msg::Discovered { key, rooms }) => {
+                Ok(Msg::Discovered {
+                    key,
+                    page,
+                    append,
+                    fresh,
+                }) => {
                     // 切分区太快时，丢弃过期结果
                     if self.discover.loaded_key.as_deref() == Some(key.as_str()) {
-                        let n = rooms.len();
-                        let name = discover::CATEGORIES[self.discover.sel].name;
-                        self.discover.rooms = rooms;
-                        self.discover.cursor = 0;
-                        self.discover.loading = false;
-                        self.discover.err = None;
-                        self.msg = format!("「{name}」{n} 个直播间 · r 换一批");
+                        self.apply_page(key, page, append, fresh);
                     }
                     self.rx = None;
                     return;
@@ -987,12 +1225,14 @@ mod tests {
                 nick: "玫玫小张帝".into(),
                 title: "到美之声".into(),
                 online: "1万+".into(),
+                viewers: 10_000,
             },
             crate::discover::RoomCard {
                 rid: "544590831076".into(),
                 nick: "乱斗教授".into(),
                 title: "上分教学".into(),
                 online: "2万".into(),
+                viewers: 20_000,
             },
         ];
         app
@@ -1017,6 +1257,177 @@ mod tests {
         assert_eq!(app.discover.cursor, 1, "越界不该移动");
         app.handle_key(key(crossterm::event::KeyCode::Up));
         assert_eq!(app.discover.cursor, 0);
+    }
+
+    fn card(rid: &str) -> crate::discover::RoomCard {
+        crate::discover::RoomCard {
+            rid: rid.into(),
+            nick: format!("主播{rid}"),
+            title: String::new(),
+            online: String::new(),
+            viewers: 0,
+        }
+    }
+
+    fn card_v(rid: &str, viewers: u64) -> crate::discover::RoomCard {
+        crate::discover::RoomCard {
+            viewers,
+            ..card(rid)
+        }
+    }
+
+    fn page(
+        rooms: Vec<crate::discover::RoomCard>,
+        next_offset: usize,
+        exhausted: bool,
+    ) -> crate::discover::Page {
+        crate::discover::Page {
+            rooms,
+            next_offset,
+            exhausted,
+            fallback: false,
+        }
+    }
+
+    fn discover_app_for(key: &str) -> App {
+        let mut app = App::new(false, None);
+        app.screen = Screen::Discover;
+        app.discover.sel = 0;
+        app.discover.loaded_key = Some(key.into());
+        app
+    }
+
+    fn rids(app: &App) -> Vec<String> {
+        app.discover.rooms.iter().map(|r| r.rid.clone()).collect()
+    }
+
+    #[test]
+    fn first_page_sorts_by_viewers_desc() {
+        let mut app = discover_app_for("4_101");
+        app.apply_page(
+            "4_101".into(),
+            page(vec![card_v("1", 10), card_v("2", 100)], 15, false),
+            false,
+            false,
+        );
+        assert_eq!(rids(&app), ["2", "1"]);
+        assert_eq!(app.discover.offset, 15);
+        assert!(!app.discover.exhausted);
+        assert!(app.msg.contains("r 下一批"), "{}", app.msg);
+    }
+
+    #[test]
+    fn next_page_appends_and_dedupes() {
+        let mut app = discover_app_for("4_101");
+        app.apply_page(
+            "4_101".into(),
+            page(vec![card("1"), card("2")], 15, false),
+            false,
+            false,
+        );
+        app.apply_page(
+            "4_101".into(),
+            page(vec![card("2"), card("3")], 30, false),
+            true,
+            false,
+        );
+        assert_eq!(rids(&app), ["1", "2", "3"], "重复的房间号不应该再次出现");
+        assert_eq!(app.discover.offset, 30);
+        assert_eq!(
+            app.discover.cursor, 2,
+            "光标应该落到新追加的第一行（3 号房）"
+        );
+        assert!(app.msg.contains("新增 1 个"), "{}", app.msg);
+    }
+
+    #[test]
+    fn restart_replaces_list_and_resets_offset() {
+        let mut app = discover_app_for("4_101");
+        app.apply_page(
+            "4_101".into(),
+            page(vec![card("1"), card("2")], 15, false),
+            false,
+            false,
+        );
+        app.apply_page(
+            "4_101".into(),
+            page(vec![card("3"), card("4")], 15, false),
+            false,
+            true,
+        );
+        assert_eq!(rids(&app), ["3", "4"]);
+        assert_eq!(app.discover.offset, 15);
+        assert!(app.msg.contains("第 1 页重来"), "{}", app.msg);
+    }
+
+    #[test]
+    fn exhausted_page_blocks_more_requests() {
+        let mut app = discover_app_for("4_101");
+        app.apply_page("4_101".into(), page(vec![card("1")], 1, true), false, false);
+        app.load_more();
+        assert!(!app.discover.loading, "看完后不应该再请求");
+        assert!(app.msg.contains("已看完"), "{}", app.msg);
+    }
+
+    #[test]
+    fn fallback_page_cannot_paginate() {
+        let mut app = discover_app_for("4_101");
+        let mut p = page(vec![card("1")], 1, true);
+        p.fallback = true;
+        app.apply_page("4_101".into(), p, false, false);
+        app.load_more();
+        assert!(!app.discover.loading);
+        assert!(
+            app.msg.contains("回退") && app.msg.contains("R"),
+            "{}",
+            app.msg
+        );
+    }
+
+    #[test]
+    fn sort_toggle_puts_small_streamers_first() {
+        let mut app = discover_app_for("4_101");
+        app.apply_page(
+            "4_101".into(),
+            page(vec![card_v("big", 1000), card_v("small", 44)], 15, false),
+            false,
+            false,
+        );
+        assert_eq!(rids(&app), ["big", "small"], "默认人数降序");
+        app.handle_key(key(crossterm::event::KeyCode::Char('s')));
+        assert_eq!(rids(&app), ["small", "big"], "s 切换人数升序");
+        assert!(app.msg.contains("升序"), "{}", app.msg);
+    }
+
+    #[test]
+    fn game_subpartition_switches_key() {
+        let mut app = App::new(false, None);
+        app.screen = Screen::Discover;
+        app.discover.sel = 2;
+        app.discover.loaded_key = Some("4_103".into());
+
+        app.handle_key(key(crossterm::event::KeyCode::Char(']')));
+        assert_eq!(app.discover.sub, 1);
+        assert_eq!(
+            app.discover.loaded_key.as_deref(),
+            Some("4_103:1011032"),
+            "游戏子分区要带 partition id"
+        );
+        assert!(app.discover.loading);
+
+        app.handle_key(key(crossterm::event::KeyCode::Char('[')));
+        assert_eq!(app.discover.sub, 0);
+        assert_eq!(app.discover.loaded_key.as_deref(), Some("4_103"));
+    }
+
+    #[test]
+    fn subpartition_keys_only_work_in_game() {
+        let mut app = with_discover_rooms();
+        app.screen = Screen::Discover;
+        app.discover.sel = 0; // 聊天
+        app.handle_key(key(crossterm::event::KeyCode::Char(']')));
+        assert_eq!(app.discover.sub, 0);
+        assert!(app.msg.contains("游戏"), "{}", app.msg);
     }
 
     #[test]

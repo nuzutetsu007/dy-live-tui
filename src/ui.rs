@@ -296,7 +296,7 @@ fn draw_quality(f: &mut Frame, app: &App, area: Rect) {
 fn draw_discover(f: &mut Frame, app: &App, area: Rect) {
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(3)])
+        .constraints([Constraint::Length(3), Constraint::Min(3)])
         .split(area);
 
     // 分区栏：选中的一块红底 + ▸，不依赖终端是否渲染 bold
@@ -319,8 +319,38 @@ fn draw_discover(f: &mut Frame, app: &App, area: Rect) {
         tabs.push(Span::styled(label, style));
         tabs.push(Span::raw(" "));
     }
+    let mut lines = vec![Line::from(tabs)];
+
+    // 游戏分区的子分区（综合 + 9 个），小主播更多
+    if app.discover.sel == 2 {
+        let mut sub_spans = Vec::new();
+        for (i, name) in std::iter::once("综合")
+            .chain(discover::GAME_SUBS.iter().map(|s| s.name))
+            .enumerate()
+        {
+            let selected = i == app.discover.sub;
+            let style = if selected {
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(Color::Red)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::DarkGray)
+            };
+            let label = if selected {
+                format!("▸ {} ", name)
+            } else {
+                format!("  {} ", name)
+            };
+            sub_spans.push(Span::styled(label, style));
+        }
+        lines.push(Line::from(sub_spans));
+    } else {
+        lines.push(Line::from(""));
+    }
+
     f.render_widget(
-        Paragraph::new(Line::from(tabs)).block(
+        Paragraph::new(Text::from(lines)).block(
             Block::default()
                 .borders(Borders::BOTTOM)
                 .border_style(Style::default().fg(Color::DarkGray)),
@@ -362,7 +392,7 @@ fn draw_discover(f: &mut Frame, app: &App, area: Rect) {
         rows.push(
             Row::new(vec![
                 Cell::from("这个分区暂时没房间"),
-                Cell::from("r 换一批"),
+                Cell::from("r 下一批"),
                 Cell::from(""),
             ])
             .style(Style::default().fg(Color::DarkGray)),
@@ -395,6 +425,21 @@ fn draw_discover(f: &mut Frame, app: &App, area: Rect) {
         }
     }
 
+    let order = if app.discover.sort_asc {
+        " · 升序"
+    } else {
+        " · 降序"
+    };
+    let done = if app.discover.exhausted {
+        " · 已看完"
+    } else {
+        ""
+    };
+    let fallback = if app.discover.fallback {
+        " · 热榜回退"
+    } else {
+        ""
+    };
     let table = Table::new(
         rows,
         [
@@ -409,7 +454,11 @@ fn draw_discover(f: &mut Frame, app: &App, area: Rect) {
             .borders(Borders::ALL)
             .border_style(Style::default().fg(Color::DarkGray))
             .title(Span::styled(
-                format!(" 找直播 · {} 个房间 ", app.discover.rooms.len()),
+                format!(
+                    " 找直播 · {} · {} 个{order}{done}{fallback} ",
+                    app.discover_label(),
+                    app.discover.rooms.len()
+                ),
                 Style::default().fg(Color::Gray),
             )),
     )
@@ -431,7 +480,7 @@ fn draw_footer(f: &mut Frame, app: &App, area: Rect) {
             "↑/↓ 选择   Enter 播放   f 强制播放   p 重测   r 重解析   Esc 返回   q 退出"
         }
         Screen::Discover => {
-            "←/→ 分区   ↑/↓ 或 j/k 选择   g/G 首尾   Enter 打开   r 换一批   Esc 返回"
+            "←/→ 分区   [ ] 子分区   ↑/↓ 或 j/k 选择   s 排序   r 下一批   R 重来   Enter 打开   Esc 返回"
         }
     };
     let mut lines = vec![Line::from(Span::styled(
@@ -598,12 +647,14 @@ mod tests {
                 nick: "玫玫小张帝".into(),
                 title: "到美之声文化传媒大舞台了".into(),
                 online: "1万+".into(),
+                viewers: 10_000,
             },
             crate::discover::RoomCard {
                 rid: "544590831076".into(),
                 nick: "乱斗教授".into(),
                 title: "上分教学".into(),
                 online: "368".into(),
+                viewers: 368,
             },
         ];
         app
@@ -619,7 +670,7 @@ mod tests {
         assert!(s.contains("在线"), "缺表头:\n{raw}");
         assert!(s.contains("玫玫小张帝"), "缺主播:\n{raw}");
         assert!(s.contains("1万+"), "缺在线人数:\n{raw}");
-        assert!(s.contains("r换一批"), "缺键位提示:\n{raw}");
+        assert!(s.contains("r下一批"), "缺键位提示:\n{raw}");
     }
 
     /// 选中的分区和房间即使终端不渲染颜色，也要能看出是哪一行

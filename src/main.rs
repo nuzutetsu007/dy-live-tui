@@ -1,3 +1,4 @@
+mod abogus;
 mod app;
 mod discover;
 mod douyin;
@@ -19,7 +20,7 @@ const HELP: &str = "\
 dy-live-tui — 抖音直播间 → 直链 → mpv
 
 用法:
-  dy-live-tui [房间号或链接]          进入 TUI（可带初始房间号）
+  dy-live-tui [房间号或链接]          进入 TUI（不带参数时自动填入上次房间号）
   dy-live-tui --resolve <房间号>      不启动 TUI，直接打印房间信息与直链
   dy-live-tui --dry-run ...           选完后不调 mpv，只把直链写到缓存文件
 
@@ -30,19 +31,30 @@ dy-live-tui — 抖音直播间 → 直链 → mpv
   -V, --version          版本
 
 TUI 内按键:
-  输入页   Enter 解析   Tab 找直播   ↑/↓ 历史导航   Ctrl-U 清空   Esc 退出
-  历史导航 j/k 移动   g/G 首尾   x/Space 标记   V 全选   d 删除   Enter 打开   Esc 返回输入
-  发现页   ←/→ 分区   ↑/↓ 或 j/k 选择   g/G 首尾   Enter 打开   r 换一批   Esc 返回
-  列表页   ↑/↓ 或 j/k 选择   Enter 播放   f 强制播放   p 重测   r 重解析   Esc 返回   q 退出
+  输入页   Enter 解析   Tab 找直播   ↑/↓ 历史导航（第一次只进入）   Ctrl-U 清空   Esc 退出
+  历史导航 j/k 或 ↑/↓ 移动（不回绕）  g/G 首尾  x/Space 标记  V 全选
+           d/Del 删除  Enter 打开  Esc 返回输入
+  找直播   ←/→ 或 h/l 切分区   [ ] 游戏子分区   ↑/↓ 或 j/k 选择   g/G 首尾
+           s 人数升/降序   r 下一批   R 从第 1 页重来   Enter 打开   Esc 返回
+  列表页   ↑/↓ 或 j/k 选择   g/G 首尾   Enter 播放   f 强制播放   p 重测   r 重解析   Esc 返回（dry-run 退出）   q 退出
 
 找直播:
-  输入页按 Tab 进入，按一级分区（聊天/音乐/游戏/…）列出在播房间。
-  数据来自分类页内嵌的 SSR JSON，5 分钟内走本地缓存（~/.cache/dy-live-tui/discover-*.json），r 强制刷新。
+  输入页按 Tab 进入，只列抖音直播的 8 个一级分区：
+  聊天 / 音乐 / 游戏 / 二次元 / 舞蹈 / 文化 / 生活 / 运动（4_101 … 4_108）。
+  纯文本列表（主播 / 标题 / 在线人数），无封面。
+  数据来自 partition/detail/room/v2 签名接口（纯 Rust a_bogus，真 offset 分页），
+  每个分区最多 200 个；签名失败时退回分类页 SSR 热榜（15 个，标题标「热榜回退」）。
+  每页 15 个、按需加载，缓存 5 分钟（~/.cache/dy-live-tui/discover-<key>-<offset>.json）。
+  r 追加下一页并按房间号去重；R 清空本分区已看记录、从第 1 页重来。
+  游戏分区有子分区（综合 / 三角洲 / 王者 / 无畏契约 … ），用 [ / ] 切换；
+  s 切换人数升序（小主播在前）/ 降序，默认降序。
+  Enter 复用房间号 → 带签名直链 → 探测 → mpv。
 
 历史:
-  只记录用 mpv 成功打开过的直播间，存在 ~/.cache/dy-live-tui/history.tsv（最近 12 条）。
-  启动时自动填入上次的房间号，回车即可重看。
-  按 ↑/↓ 进入历史导航（vim 逻辑）：j/k 移动 g/G 首尾，x 标记，V 全选，d 删除，Esc 返回输入。
+  只记录用 mpv 成功打开（退出码 0）的直播间，存在 ~/.cache/dy-live-tui/history.tsv（最近 12 条）。
+  输入页每行：[ ]/[x] 主播名 房间号 标题；启动时自动填入上次房间号，回车即可重看。
+  按 ↑/↓ 进入历史导航（第一次只进入）：j/k 移动、g/G 首尾、x/Space 标记、
+  V 全选、d/Del 删除、Enter 打开、Esc 返回输入；删除立即写回 history.tsv。
 ";
 
 fn init() -> io::Result<Term> {

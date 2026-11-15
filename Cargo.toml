@@ -1,6 +1,6 @@
 [package]
 name = "dy-live-tui"
-version = "0.2.0"
+version = "0.3.0"
 edition = "2021"
 description = "抖音直播间直链解析 TUI —— 选清晰度、测连通、交给本地 mpv 播放"
 license = "MIT"
