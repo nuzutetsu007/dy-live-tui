@@ -380,30 +380,49 @@ pub fn resolve(rid: &str) -> Result<(Room, Vec<Candidate>), String> {
     Ok((room, cands))
 }
 
+/// 单次探测的超时。4 路并发时慢边缘节点首字节可能 >5s，给到 8s 避免误判。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(8);
+/// 传输层失败（超时 / 连接重置 / DNS 抖动）的重试次数，HTTP 状态码失败不重试。
+const PROBE_RETRIES: usize = 1;
+/// 重试前的退避，给抖动一点点恢复时间
+const PROBE_RETRY_BACKOFF: Duration = Duration::from_millis(200);
+
 /// 探测直链可用性：发 Range 请求，只看响应头/状态码（不下载内容）
+///
+/// 只有拿不到任何 HTTP 响应（`code == 0`，如超时/连接失败）才重试一次；
+/// 已返回 403/404 这类明确结果的不重试，避免无意义的等待。
 pub fn probe(url: &str) -> Probe {
     let start = Instant::now();
-    let result = agent(Duration::from_secs(5))
-        .get(url)
-        .set("Range", "bytes=0-2047")
-        .call();
-    let ms = start.elapsed().as_millis();
-    match result {
-        Ok(resp) => Probe {
-            done: true,
-            code: resp.status(),
-            ms,
-        },
-        Err(ureq::Error::Status(code, _)) => Probe {
-            done: true,
-            code,
-            ms,
-        },
-        Err(_) => Probe {
-            done: true,
-            code: 0,
-            ms,
-        },
+    for attempt in 0..=PROBE_RETRIES {
+        let result = agent(PROBE_TIMEOUT)
+            .get(url)
+            .set("Range", "bytes=0-2047")
+            .call();
+        match result {
+            Ok(resp) => {
+                return Probe {
+                    done: true,
+                    code: resp.status(),
+                    ms: start.elapsed().as_millis(),
+                }
+            }
+            Err(ureq::Error::Status(code, _)) => {
+                return Probe {
+                    done: true,
+                    code,
+                    ms: start.elapsed().as_millis(),
+                }
+            }
+            Err(_) if attempt < PROBE_RETRIES => {
+                std::thread::sleep(PROBE_RETRY_BACKOFF);
+            }
+            Err(_) => break,
+        }
+    }
+    Probe {
+        done: true,
+        code: 0,
+        ms: start.elapsed().as_millis(),
     }
 }
 
@@ -464,6 +483,42 @@ mod tests {
         }
         .ok());
         assert!(!Probe::PENDING.ok());
+    }
+
+    /// 传输层失败（这里用「接受连接后立刻断开」模拟）应该重试一次，
+    /// 而不是直接判死链。
+    #[test]
+    fn probe_retries_once_on_transport_error() {
+        use std::net::TcpListener;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let hits = Arc::new(AtomicUsize::new(0));
+
+        let handle = {
+            let hits = Arc::clone(&hits);
+            std::thread::spawn(move || {
+                listener.set_nonblocking(true).unwrap();
+                let deadline = Instant::now() + Duration::from_secs(5);
+                while Instant::now() < deadline && hits.load(Ordering::SeqCst) < 2 {
+                    match listener.accept() {
+                        Ok((sock, _)) => {
+                            drop(sock); // 不回任何数据，制造传输层错误
+                            hits.fetch_add(1, Ordering::SeqCst);
+                        }
+                        Err(_) => std::thread::sleep(Duration::from_millis(20)),
+                    }
+                }
+            })
+        };
+
+        let p = probe(&format!("http://127.0.0.1:{port}/x"));
+        handle.join().unwrap();
+
+        assert_eq!(p.code, 0);
+        assert_eq!(hits.load(Ordering::SeqCst), 2, "传输层失败应恰好重试一次");
     }
 
     #[test]
