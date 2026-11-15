@@ -148,7 +148,7 @@ fn draw_loading(f: &mut Frame, app: &App, area: Rect) {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            "  解析房间 → 拉 sigend 直链 → 逐条探测 CDN",
+            "  解析房间 → 拉 signed 直链 → 逐条探测 CDN",
             Style::default().fg(Color::DarkGray),
         )),
     ];
