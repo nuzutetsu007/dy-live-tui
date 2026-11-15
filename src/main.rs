@@ -1,4 +1,5 @@
 mod app;
+mod discover;
 mod douyin;
 mod history;
 mod ui;
@@ -29,12 +30,19 @@ dy-live-tui — 抖音直播间 → 直链 → mpv
   -V, --version          版本
 
 TUI 内按键:
-  输入页   Enter 解析   ↑/↓ 选最近打开   Ctrl-U 清空   Esc 退出
+  输入页   Enter 解析   Tab 找直播   ↑/↓ 历史导航   Ctrl-U 清空   Esc 退出
+  历史导航 j/k 移动   g/G 首尾   x/Space 标记   V 全选   d 删除   Enter 打开   Esc 返回输入
+  发现页   ←/→ 分区   ↑/↓ 或 j/k 选择   g/G 首尾   Enter 打开   r 换一批   Esc 返回
   列表页   ↑/↓ 或 j/k 选择   Enter 播放   f 强制播放   p 重测   r 重解析   Esc 返回   q 退出
+
+找直播:
+  输入页按 Tab 进入，按一级分区（聊天/音乐/游戏/…）列出在播房间。
+  数据来自分类页内嵌的 SSR JSON，5 分钟内走本地缓存（~/.cache/dy-live-tui/discover-*.json），r 强制刷新。
 
 历史:
   只记录用 mpv 成功打开过的直播间，存在 ~/.cache/dy-live-tui/history.tsv（最近 12 条）。
-  启动时自动填入上次的房间号，回车即可重看；↑/↓ 可在最近列表里切换。
+  启动时自动填入上次的房间号，回车即可重看。
+  按 ↑/↓ 进入历史导航（vim 逻辑）：j/k 移动 g/G 首尾，x 标记，V 全选，d 删除，Esc 返回输入。
 ";
 
 fn init() -> io::Result<Term> {

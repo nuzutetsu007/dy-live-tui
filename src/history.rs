@@ -3,6 +3,7 @@
 //! 存放在 `~/.cache/dy-live-tui/history.tsv`（`XDG_CACHE_HOME` 优先），
 //! 每行 `rid \t 主播名 \t 标题`，最近打开的在最前面。
 
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -10,27 +11,6 @@ pub struct Entry {
     pub rid: String,
     pub nick: String,
     pub title: String,
-}
-
-impl Entry {
-    /// 一行显示用的摘要，过长按字符截断（CJK 也算一个字符）
-    pub fn summary(&self, max: usize) -> String {
-        let mut s = String::new();
-        if !self.nick.is_empty() {
-            s.push_str(&self.nick);
-        }
-        if !self.title.is_empty() {
-            if !s.is_empty() {
-                s.push_str(" · ");
-            }
-            s.push_str(&self.title);
-        }
-        if s.chars().count() > max {
-            let t: String = s.chars().take(max.saturating_sub(1)).collect();
-            s = format!("{t}…");
-        }
-        s
-    }
 }
 
 pub struct History {
@@ -100,6 +80,25 @@ impl History {
         );
         self.entries.truncate(self.limit);
         self.save();
+    }
+
+    /// 删掉一条历史（按房间号），返回是否真的删了。
+    pub fn remove(&mut self, rid: &str) -> bool {
+        self.remove_many(&[rid.to_string()].into_iter().collect()) > 0
+    }
+
+    /// 批量删除（多选），返回删除条数；有变化才落盘。
+    pub fn remove_many(&mut self, rids: &HashSet<String>) -> usize {
+        if rids.is_empty() {
+            return 0;
+        }
+        let before = self.entries.len();
+        self.entries.retain(|e| !rids.contains(&e.rid));
+        let removed = before - self.entries.len();
+        if removed > 0 {
+            self.save();
+        }
+        removed
     }
 
     fn save(&self) {
@@ -196,14 +195,52 @@ mod tests {
     }
 
     #[test]
-    fn summary_truncates() {
-        let e = Entry {
-            rid: "1".into(),
-            nick: "主播".into(),
-            title: "一个很长很长的标题".into(),
-        };
-        let s = e.summary(8);
-        assert!(s.chars().count() <= 8, "{s}");
-        assert!(s.ends_with('…'));
+    fn remove_drops_one_and_persists() {
+        let p = tmp("remove");
+        let mut h = History::load_from(&p);
+        h.add("111", "主播A", "标题A");
+        h.add("222", "主播B", "标题B");
+
+        assert!(h.remove("111"), "存在的条目应该删除成功");
+        assert!(!h.remove("111"), "删掉后再删应该返回 false");
+        assert_eq!(h.entries().len(), 1);
+        assert_eq!(h.entries()[0].rid, "222");
+
+        // 落盘：重新加载还是只剩一条
+        let h = History::load_from(&p);
+        assert_eq!(h.entries().len(), 1);
+        assert_eq!(h.entries()[0].rid, "222");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn remove_many_drops_all_selected_and_persists() {
+        let p = tmp("remove_many");
+        let mut h = History::load_from(&p);
+        h.add("111", "主播A", "标题A");
+        h.add("222", "主播B", "标题B");
+        h.add("333", "主播C", "标题C");
+
+        let rids: std::collections::HashSet<String> =
+            ["111".to_string(), "333".to_string()].into_iter().collect();
+        assert_eq!(h.remove_many(&rids), 2);
+        assert_eq!(h.entries().len(), 1);
+        assert_eq!(h.entries()[0].rid, "222");
+
+        let h = History::load_from(&p);
+        assert_eq!(h.entries().len(), 1);
+        assert_eq!(h.entries()[0].rid, "222");
+        let _ = std::fs::remove_file(&p);
+    }
+
+    #[test]
+    fn remove_many_with_unknown_rid_is_noop() {
+        let p = tmp("remove_unknown");
+        let mut h = History::load_from(&p);
+        h.add("111", "主播A", "标题A");
+        let rids: std::collections::HashSet<String> = ["999".to_string()].into_iter().collect();
+        assert_eq!(h.remove_many(&rids), 0);
+        assert_eq!(h.entries().len(), 1);
+        let _ = std::fs::remove_file(&p);
     }
 }
