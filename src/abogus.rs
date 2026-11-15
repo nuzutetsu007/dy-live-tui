@@ -137,7 +137,7 @@ fn sm3_hash(data: &[u8]) -> [u8; 32] {
     let bits = (data.len() as u64).wrapping_mul(8);
     padded.extend_from_slice(&bits.to_be_bytes());
 
-    for block in padded.chunks_exact(64) {
+    for block in padded.chunks(64) {
         sm3_compress(&mut reg, block);
     }
 
